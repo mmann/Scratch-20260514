@@ -2,7 +2,7 @@ test_out/
 __pycache__/
 # Filter outputs and analysis intermediates - regenerable from derings.py.
 filtered_*.png
-filt_tan*.png
+filt_*.png
 fft_*.png
 polar.png
 center_overlay.png
