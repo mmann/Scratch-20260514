@@ -165,6 +165,69 @@ def estimate_center(
     return float(cx), float(cy)
 
 
+def windowed_polar_subtract(
+    img: np.ndarray,
+    center: tuple[float, float],
+    angular_window_deg: float = 12.0,
+    n_angles: int = 1440,
+) -> np.ndarray:
+    """Subtract a ring profile that is allowed to vary slowly with angle.
+
+    The image is warped to polar coordinates and at each (angle, radius) the
+    estimated ring intensity is the median over a +/- (angular_window_deg/2)
+    window in angle - this is a moving median along the angular axis.
+    Scene detail that is not coherent across that angular span is preserved
+    because the median is robust to outliers.
+
+    Returns the filtered image in the original Cartesian frame.
+    """
+    from scipy.ndimage import median_filter
+
+    h, w = img.shape
+    cx, cy = center
+    corners = [(0, 0), (w, 0), (0, h), (w, h)]
+    max_r = float(max(np.hypot(px - cx, py - cy) for px, py in corners))
+    src = np.ascontiguousarray(img.astype(np.float32))
+
+    polar = cv2.warpPolar(
+        src,
+        (int(max_r), n_angles),
+        (cx, cy),
+        max_r,
+        cv2.WARP_POLAR_LINEAR + cv2.INTER_LINEAR,
+    )
+    # warpPolar can produce NaN at extreme corners with INTER_LINEAR. Replace
+    # with 0 so the valid-mask logic below treats them as out-of-frame.
+    polar = np.nan_to_num(polar, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Pixels outside the image footprint warp to 0. To prevent them from
+    # biasing the median, replace them column-wise with the column's own
+    # in-frame median (a constant value contributes nothing to the residual
+    # in the valid region) before filtering.
+    valid = polar > 0
+    col_medians = np.zeros(polar.shape[1], dtype=np.float32)
+    for col in range(polar.shape[1]):
+        m = valid[:, col]
+        if m.any():
+            col_medians[col] = np.median(polar[m, col])
+    filled = np.where(valid, polar, col_medians[None, :])
+
+    window_px = max(3, int(round(angular_window_deg / 360.0 * n_angles)) | 1)
+    profile = median_filter(filled, size=(window_px, 1), mode="wrap")
+
+    polar_residual = np.where(valid, polar - profile, 0.0)
+    back = cv2.warpPolar(
+        polar_residual.astype(np.float32),
+        (w, h),
+        (cx, cy),
+        max_r,
+        cv2.WARP_POLAR_LINEAR + cv2.WARP_INVERSE_MAP + cv2.INTER_LINEAR,
+    )
+
+    # Re-add the global mean to keep brightness roughly the same as the input.
+    return back + float(img.mean())
+
+
 def radial_profile_subtract(img: np.ndarray, center: tuple[float, float]) -> tuple[np.ndarray, np.ndarray]:
     """Subtract the median radial profile around `center`. Returns (filtered, profile)."""
     h, w = img.shape
@@ -234,9 +297,17 @@ def tangential_smooth(img: np.ndarray, center: tuple[float, float], sigma: float
 def derings(
     img: np.ndarray,
     tangential_sigma: float = 0.0,
+    angular_window_deg: float = 0.0,
     overlay_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict]:
-    """Main entry point. Returns (filtered_uint8, info_dict)."""
+    """Main entry point.
+
+    When `angular_window_deg` is 0 the filter subtracts a single radial profile
+    (assumes the rings are purely concentric about one center). When it is
+    positive the filter instead subtracts a profile that varies slowly with
+    angle - estimated as a moving median over an angular window of that width.
+    This handles fringes that are tilted or off-axis (elliptical/parabolic).
+    """
     if img.ndim == 3:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     else:
@@ -254,7 +325,11 @@ def derings(
     # radial-component energy in a local neighborhood.
     cx, cy = refine_center(gray_f, cx, cy)
 
-    filtered, profile = radial_profile_subtract(gray_f, (cx, cy))
+    profile = None
+    if angular_window_deg > 0:
+        filtered = windowed_polar_subtract(gray_f, (cx, cy), angular_window_deg)
+    else:
+        filtered, profile = radial_profile_subtract(gray_f, (cx, cy))
     if tangential_sigma > 0:
         filtered = tangential_smooth(filtered, (cx, cy), tangential_sigma)
 
@@ -272,12 +347,18 @@ def main() -> None:
     p.add_argument("output", type=Path)
     p.add_argument("--tangential-sigma", type=float, default=0.0,
                    help="Gaussian sigma (in angular pixels) for optional moire suppression.")
+    p.add_argument("--angular-window-deg", type=float, default=0.0,
+                   help="If >0, subtract a per-angle radial profile estimated as a moving "
+                        "median over this angular window (degrees). Handles tilted/elliptical "
+                        "fringes that aren't perfectly concentric.")
     args = p.parse_args()
 
     img = cv2.imread(str(args.input), cv2.IMREAD_GRAYSCALE)
     if img is None:
         raise SystemExit(f"Could not read {args.input}")
-    out, info = derings(img, tangential_sigma=args.tangential_sigma)
+    out, info = derings(img,
+                        tangential_sigma=args.tangential_sigma,
+                        angular_window_deg=args.angular_window_deg)
     cv2.imwrite(str(args.output), out)
     cx, cy = info["center"]
     print(f"Estimated ring center: ({cx:.1f}, {cy:.1f})")
