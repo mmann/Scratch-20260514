@@ -27,6 +27,65 @@ import cv2
 import numpy as np
 
 
+def _radial_component_energy(img_f: np.ndarray, cx: float, cy: float,
+                             ys: np.ndarray, xs: np.ndarray) -> float:
+    """Variance of the azimuthal mean per radius - purely-radial component energy.
+
+    Pixels that form a coherent set of concentric rings about (cx, cy) all
+    contribute to one radial bin, so this peaks at the true ring center.
+    """
+    r = np.round(np.hypot(xs - cx, ys - cy)).astype(np.int32)
+    flat_r = r.ravel()
+    flat_v = img_f.ravel()
+    n_bins = int(flat_r.max()) + 1
+    counts = np.bincount(flat_r, minlength=n_bins)
+    sums = np.bincount(flat_r, weights=flat_v, minlength=n_bins)
+    means = np.where(counts > 0, sums / np.maximum(counts, 1), 0.0)
+    total = max(np.sum(counts), 1)
+    weighted_mean = np.sum(sums) / total
+    diffs = means - weighted_mean
+    return float(np.sum(counts * diffs * diffs) / total)
+
+
+def refine_center(gray: np.ndarray, cx0: float, cy0: float,
+                  search_radius: int = 150, step: int = 6) -> tuple[float, float]:
+    """Brute-force refine the center by maximizing radial-component energy.
+
+    Operates on a bandpassed copy so only ring-scale structure is scored.
+    """
+    g = gray.astype(np.float64)
+    low = cv2.GaussianBlur(g, (0, 0), sigmaX=2.5, sigmaY=2.5)
+    very_low = cv2.GaussianBlur(g, (0, 0), sigmaX=40.0, sigmaY=40.0)
+    bandpass = (low - very_low).astype(np.float64)
+
+    h, w = gray.shape
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float64)
+
+    def best_in(cx_range, cy_range):
+        best = (-np.inf, (cx0, cy0))
+        for cy in cy_range:
+            for cx in cx_range:
+                s = _radial_component_energy(bandpass, cx, cy, ys, xs)
+                if s > best[0]:
+                    best = (s, (cx, cy))
+        return best
+
+    # Coarse pass around initial estimate.
+    cx_lo = int(round(cx0 - search_radius))
+    cx_hi = int(round(cx0 + search_radius)) + 1
+    cy_lo = int(round(cy0 - search_radius))
+    cy_hi = int(round(cy0 + search_radius)) + 1
+    _, (cx, cy) = best_in(range(cx_lo, cx_hi, step), range(cy_lo, cy_hi, step))
+
+    # Finer pass.
+    _, (cx, cy) = best_in(range(int(cx) - step, int(cx) + step + 1),
+                          range(int(cy) - step, int(cy) + step + 1))
+    # Half-pixel pass.
+    _, (cx, cy) = best_in(np.arange(cx - 1.5, cx + 1.5, 0.5),
+                          np.arange(cy - 1.5, cy + 1.5, 0.5))
+    return float(cx), float(cy)
+
+
 def estimate_center(
     gray: np.ndarray,
     mask: np.ndarray | None = None,
@@ -190,6 +249,10 @@ def derings(
         fit_mask = (overlay_mask == 0).astype(np.float64)
 
     cx, cy = estimate_center(gray_f, fit_mask)
+    # Gradient-line fitting can be pulled off-axis by aliased moire or scene
+    # gradients that aren't actually radial. Refine by directly maximizing the
+    # radial-component energy in a local neighborhood.
+    cx, cy = refine_center(gray_f, cx, cy)
 
     filtered, profile = radial_profile_subtract(gray_f, (cx, cy))
     if tangential_sigma > 0:
